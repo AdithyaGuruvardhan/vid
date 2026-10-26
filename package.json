@@ -1,0 +1,26 @@
+{
+  "name": "motion-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Code-driven motion graphics: Claude writes a deterministic seek(t) composition, Chromium renders it, FFmpeg encodes it.",
+  "scripts": {
+    "preview": "node preview.mjs",
+    "render": "node render.mjs",
+    "render:draft": "node render.mjs --draft",
+    "render:final": "node render.mjs --sub 4",
+    "render:all": "node render.mjs --format 9x16 && node render.mjs --format 1x1 && node render.mjs --format 16x9",
+    "poster": "node render.mjs --still 14.2 --out out/poster.png",
+    "sfx": "node sfx.mjs",
+    "mux": "bash scripts/mux.sh",
+    "build": "node render.mjs --sub 4 && node sfx.mjs && bash scripts/mux.sh && bash scripts/contact.sh",
+    "contact": "bash scripts/contact.sh",
+    "phone": "bash scripts/phone.sh",
+    "strip": "bash scripts/strip.sh",
+    "loop": "bash scripts/loop.sh",
+    "beats": "python3 beats.py"
+  },
+  "devDependencies": {
+    "playwright": "^1.64.1"
+  }
+}

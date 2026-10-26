@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Motion Studio</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #050505; overflow: hidden; }
+  #wrap { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #stage {
+    position: relative; overflow: hidden; background: #0d0d0c; color: #efece4;
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased; font-variant-numeric: tabular-nums;
+  }
+  #ui {
+    position: fixed; left: 0; right: 0; bottom: 0; height: 44px; box-sizing: border-box;
+    display: flex; gap: 12px; align-items: center; padding: 0 16px;
+    background: #111; color: #aaa; font: 12px Menlo, monospace;
+  }
+  #ui input { flex: 1; }
+  #ui a { color: #aaa; }
+  body.render #ui { display: none; }
+</style>
+</head>
+<body>
+<div id="wrap"><div id="stage"></div></div>
+<div id="ui">
+  <button id="play">play</button>
+  <input id="scrub" type="range" min="0" step="0.001" value="0">
+  <span id="time">0.000s</span>
+  <a href="?format=9x16">9:16</a> <a href="?format=1x1">1:1</a> <a href="?format=16x9">16:9</a>
+</div>
+
+<script type="module">
+import { clamp, lerp, prog, bump, ease, spring, SPRING, chain, mixColor, rng } from './lib/motion.js';
+import { T, FPS, DURATION, BARS, TYPE_LINE } from './src/timeline.js';
+
+// ───────────────────────── format ─────────────────────────
+const FORMATS = { '9x16': [1080, 1920], '1x1': [1080, 1080], '16x9': [1920, 1080] };
+const params = new URLSearchParams(location.search);
+const FORMAT = params.get('format') in FORMATS ? params.get('format') : '9x16';
+const [W, H] = FORMATS[FORMAT];
+const U = Math.min(W, H) / 100;           // 1U = 1% of the short side
+const PORTRAIT = H > W, LANDSCAPE = W > H;
+const M = 7 * U;                           // outer margin
+
+const COL = { ink: '#0d0d0c', paper: '#efece4', accent: '#ff4a1c', mute: '#8c897f', tile: '#1d1c19' };
+const SANS = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+const MONO = '"SF Mono", Menlo, monospace';
+
+const stage = document.getElementById('stage');
+Object.assign(stage.style, { width: `${W}px`, height: `${H}px` });
+if (params.has('render')) document.body.classList.add('render');
+
+// ───────────────────────── dom helpers ─────────────────────────
+const px = v => `${v}px`;
+function el(parent, style = {}, html) {
+  const n = document.createElement('div');
+  n.style.position = 'absolute';
+  Object.assign(n.style, style);
+  if (html != null) n.innerHTML = html;
+  parent.appendChild(n);
+  return n;
+}
+const show = (n, on) => { n.style.visibility = on ? 'visible' : 'hidden'; };
+const tf = (n, x = 0, y = 0, s = 1, r = 0) => { n.style.transform = `translate(${x}px,${y}px) rotate(${r}deg) scale(${s})`; };
+
+// Width of `text` at 100px, used to fit type to the frame for every aspect ratio.
+function measure(text, { weight = 800, tracking = -0.045, font = SANS } = {}) {
+  const n = el(stage, { fontFamily: font, fontWeight: weight, fontSize: '100px', letterSpacing: `${tracking}em`, whiteSpace: 'pre' });
+  n.textContent = text;
+  const w = n.offsetWidth;
+  n.remove();
+  return w;
+}
+const fitSize = (texts, maxW, opts) => (maxW / Math.max(...texts.map(s => measure(s, opts)))) * 100;
+
+// A line of type split into characters that animate inside the line's overflow mask.
+function typeLine(parent, text, { size, weight = 800, tracking = -0.045, color = COL.paper, font = SANS, accentFrom = Infinity }) {
+  const line = el(parent, {
+    overflow: 'hidden', whiteSpace: 'pre', lineHeight: '1', fontFamily: font, fontWeight: weight,
+    fontSize: px(size), letterSpacing: `${tracking}em`, color, padding: `${size * 0.1}px ${size * 0.04}px ${size * 0.06}px 0`,
+  });
+  const chars = [...text].map((ch, i) => {
+    const s = document.createElement('span');
+    s.textContent = ch;
+    s.style.display = 'inline-block';
+    if (i >= accentFrom) s.style.color = COL.accent;
+    line.appendChild(s);
+    return s;
+  });
+  return { line, chars, w: line.offsetWidth, h: line.offsetHeight };
+}
+
+// Characters rise in from below the mask and leave upward.
+function riseChars(L, t, tIn, tOut, { stagger = 0.03, outStagger = 0.015, preset = SPRING.text } = {}) {
+  L.chars.forEach((c, i) => {
+    const kin = spring(t - (tIn + i * stagger), preset);
+    const kout = ease.inCubic(prog(t, tOut + i * outStagger, 0.3));
+    tf(c, 0, (1 - kin) * L.h - kout * L.h * 1.05);
+  });
+}
+
+// ───────────────────────── A · HOOK ─────────────────────────
+function sceneHook() {
+  const root = el(stage, { inset: 0 });
+  const words = ['MAKE', 'IT', 'MOVE.'];
+  const opts = { weight: 900, tracking: -0.055 };
+  const size = Math.min(fitSize(words, W - 2 * M, opts), (H - 2 * M) / 3.2, PORTRAIT ? 40 * U : 34 * U);
+  const block = el(root, { left: px(M) });
+  const lines = words.map(w => typeLine(block, w, { size, ...opts, accentFrom: w.endsWith('.') ? w.length - 1 : Infinity }));
+  const step = size * 0.92;
+  lines.forEach((L, i) => { L.line.style.top = px(i * step); });
+  const blockH = step * 2 + lines[2].h;
+  Object.assign(block.style, { top: px((H - blockH) / 2), height: px(blockH), transformOrigin: `0 50%` });
+  const rule = el(block, { left: 0, top: px(blockH + 1.5 * U), width: px(lines[2].w * 0.94), height: px(1.6 * U), background: COL.accent });
+
+  return t => {
+    const on = t < T.b.wipe + 0.6;
+    show(root, on);
+    if (!on) return;
+    lines.forEach((L, i) => riseChars(L, t, T.a.start + i * 0.14, T.a.out + i * 0.05, { stagger: 0.04, outStagger: 0.018, preset: SPRING.heavy }));
+    const kin = ease.outExpo(prog(t, 0.95, 0.6)), kout = ease.inCubic(prog(t, T.a.out - 0.1, 0.3));
+    rule.style.transformOrigin = kout > 0 ? '100% 50%' : '0 50%';
+    rule.style.transform = `scaleX(${kin * (1 - kout)})`;
+    tf(block, 0, 0, lerp(1, 1.07, ease.inOutCubic(prog(t, 0.4, T.a.out))));
+  };
+}
+
+// ───────────────────────── B · EVERY FRAME IS A FUNCTION OF TIME ─────────────────────────
+function sceneTime() {
+  const root = el(stage, { inset: 0 });
+  const panel = el(root, { left: 0, top: 0, width: px(W), height: px(H), background: COL.paper });
+  const words = ['Every frame', 'is a function', 'of time.'];
+  const opts = { weight: 800, tracking: -0.04 };
+  const size = Math.min(fitSize(words, LANDSCAPE ? W * 0.6 : W - 2 * M, opts), PORTRAIT ? 15 * U : 12 * U);
+  const block = el(root, { left: px(M) });
+  const lines = words.map(w => typeLine(block, w, { size, ...opts, color: COL.ink, accentFrom: w.includes('time') ? w.indexOf('time') : Infinity }));
+  lines.forEach((L, i) => { L.line.style.top = px(i * size); });
+  const blockH = size * 2 + lines[0].h;
+
+  const readSize = PORTRAIT ? 7 * U : 5.5 * U;
+  const readout = el(root, { left: px(M), fontFamily: MONO, fontSize: px(readSize), fontWeight: 500, color: COL.ink, whiteSpace: 'pre', lineHeight: '1' });
+
+  // timeline ruler with a playhead that sweeps across it
+  const rulerW = W - 2 * M, rulerH = 10 * U, N = 64;
+  const ruler = el(root, { left: px(M), width: px(rulerW), height: px(rulerH) });
+  const r = rng(7);
+  const ticks = Array.from({ length: N }, (_, i) => {
+    const major = i % 8 === 0;
+    const x = (i / (N - 1)) * rulerW;
+    const n = el(ruler, { left: px(x), bottom: 0, width: px(major ? 0.5 * U : 0.3 * U), height: px(major ? 9 * U : lerp(2 * U, 5.5 * U, r())), background: COL.ink, transformOrigin: '50% 100%' });
+    return { n, x };
+  });
+  const head = el(ruler, { left: 0, bottom: px(-2 * U), width: px(0.5 * U), height: px(15 * U), background: COL.accent, transformOrigin: '50% 100%' });
+
+  // text, readout and ruler read as one group, centered vertically
+  const stackH = blockH + 5 * U + readSize, rulerGap = 12 * U;
+  const top = (H - (stackH + rulerGap + rulerH)) / 2;
+  block.style.top = px(top);
+  readout.style.top = px(top + blockH + 5 * U);
+  ruler.style.top = px(top + stackH + rulerGap);
+
+  return t => {
+    const on = t >= T.b.wipe && t < T.d.start + 0.1;
+    show(root, on);
+    if (!on) return;
+    tf(panel, 0, (1 - ease.inOutExpo(prog(t, T.b.wipe, 0.6))) * H);
+    lines.forEach((L, i) => riseChars(L, t, T.b.start + i * 0.12, T.b.out + i * 0.05, { stagger: 0.014, outStagger: 0.008 }));
+
+    const k = spring(t - (T.b.start + 0.45), SPRING.ui), ko = ease.inCubic(prog(t, T.b.out + 0.12, 0.25));
+    readout.style.opacity = clamp(k) * (1 - ko);
+    tf(readout, 0, (1 - k) * 3 * U - ko * 3 * U);
+    readout.innerHTML = `seek(<span style="color:${COL.accent}">${clamp(t, 0, DURATION).toFixed(3)}</span>)`;
+
+    const hk = spring(t - (T.b.start + 0.3), SPRING.snappy) * (1 - ko);
+    const hx = lerp(0, rulerW, prog(t, T.b.start + 0.3, T.b.out - T.b.start + 0.2));
+    head.style.transform = `translateX(${hx}px) scaleY(${hk})`;
+    ticks.forEach(({ n, x }, i) => {
+      const lift = 1 + 0.9 * Math.exp(-(((x - hx) / (3 * U)) ** 2)) * hk;
+      n.style.transform = `scaleY(${spring(t - (T.b.start + 0.2 + i * 0.008), SPRING.snappy) * lift * (1 - ko)})`;
+    });
+  };
+}
+
+// ───────────────────────── C · UI MORPH ─────────────────────────
+// One container stays alive: button → loader → success → card → square → full-frame wipe.
+function sceneMorph() {
+  const root = el(stage, { inset: 0 });
+  const c = T.c, cx = W / 2, cy = H / 2;
+  const cardW = PORTRAIT ? 84 * U : LANDSCAPE ? 120 * U : 80 * U;
+  const cardH = PORTRAIT ? 100 * U : LANDSCAPE ? 70 * U : 72 * U;
+  const COVER = 2.4 * Math.max(W, H);
+  const keysW = [[c.start, 46 * U], [c.loader, 16 * U], [c.card, cardW, SPRING.card], [c.collapse, 10 * U, SPRING.snappy], [c.cover, COVER, SPRING.card]];
+  const keysH = [[c.start, 14 * U], [c.loader, 16 * U], [c.card, cardH, SPRING.card], [c.collapse, 10 * U, SPRING.snappy], [c.cover, COVER, SPRING.card]];
+  const keysR = [[c.start, 7 * U], [c.loader, 8 * U], [c.card, 3.2 * U, SPRING.card], [c.collapse, 2 * U, SPRING.snappy], [c.cover, COVER / 2, SPRING.card]];
+
+  const box = el(root, { overflow: 'hidden' });
+  const center = el(box, { left: '50%', top: '50%' });
+  const label = el(center, {
+    left: px(-23 * U), top: px(-7 * U), width: px(46 * U), height: px(14 * U), display: 'flex', alignItems: 'center',
+    justifyContent: 'center', gap: px(2 * U), fontSize: px(5.4 * U), fontWeight: 700, letterSpacing: '-0.02em', color: COL.paper,
+  }, `Render <svg width="${3 * U}" height="${3 * U}" viewBox="0 0 10 10"><path d="M1 0 L10 5 L1 10 Z" fill="${COL.accent}"/></svg>`);
+  const ring = el(center, { left: px(-8 * U), top: px(-8 * U), width: px(16 * U), height: px(16 * U) },
+    `<svg width="100%" height="100%" viewBox="0 0 100 100"><circle cx="50" cy="50" r="30" fill="none" stroke="${COL.paper}" stroke-width="7" stroke-linecap="round" stroke-dasharray="120 400"/></svg>`);
+  const check = el(center, { left: px(-8 * U), top: px(-8 * U), width: px(16 * U), height: px(16 * U) },
+    `<svg width="100%" height="100%" viewBox="0 0 100 100"><path d="M31 52 L45 66 L71 37" fill="none" stroke="${COL.ink}" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="60" stroke-dashoffset="60"/></svg>`);
+  const checkPath = check.querySelector('path');
+
+  const pad = 5 * U;
+  const card = el(center, { left: px(-cardW / 2), top: px(-cardH / 2), width: px(cardW), height: px(cardH) });
+  el(card, { left: px(pad), top: px(pad), fontFamily: MONO, fontSize: px(3.6 * U), color: COL.paper }, 'out/final.mp4');
+  el(card, { right: px(pad), top: px(pad + 0.6 * U), fontFamily: MONO, fontSize: px(2.8 * U), letterSpacing: '0.08em', color: COL.accent }, '● RENDERED');
+  el(card, { left: px(pad), top: px(pad + 8 * U), width: px(cardW - 2 * pad), height: px(0.25 * U), background: 'rgba(239,236,228,.16)' });
+  const chartTop = pad + 13 * U, chartBottom = cardH - pad - 11 * U;
+  const barGap = 1.4 * U, barW = (cardW - 2 * pad - (BARS - 1) * barGap) / BARS;
+  const r = rng(11);
+  const bars = Array.from({ length: BARS }, (_, i) => {
+    const last = i === BARS - 1;
+    const k = last ? 1 : clamp(0.25 + (0.6 * i) / (BARS - 1) + (r() - 0.5) * 0.3, 0.15, 0.92);
+    const h = k * (chartBottom - chartTop);
+    return el(card, { left: px(pad + i * (barW + barGap)), top: px(chartBottom - h), width: px(barW), height: px(h), borderRadius: px(0.6 * U), background: last ? COL.accent : COL.paper, transformOrigin: '50% 100%' });
+  });
+  const footer = el(card, { left: px(pad), bottom: px(pad), fontFamily: MONO, fontSize: px(3.6 * U), color: COL.paper, whiteSpace: 'pre' });
+
+  const clickX = cx + 9 * U, clickY = cy + 3 * U;
+  const ripple = el(root, { left: px(clickX - 9 * U), top: px(clickY - 9 * U), width: px(18 * U), height: px(18 * U), borderRadius: '50%', border: `${0.5 * U}px solid ${COL.accent}`, boxSizing: 'border-box' });
+  const CUR = 7 * U;
+  const cursor = el(root, { width: px(CUR), height: px(CUR), transformOrigin: '12% 8%' },
+    `<svg width="100%" height="100%" viewBox="0 0 24 24"><path d="M3 2 L3 19 L8 14.5 L11.5 22 L14.5 20.7 L11 13.4 L17.5 13.4 Z" fill="${COL.ink}" stroke="${COL.paper}" stroke-width="1.3" stroke-linejoin="round"/></svg>`);
+
+  return t => {
+    const on = t >= c.start - 0.01 && t < T.d.start + 0.2;
+    show(root, on);
+    if (!on) return;
+
+    const w = chain(t, keysW), h = chain(t, keysH), rad = chain(t, keysR);
+    const s = spring(t - c.start, SPRING.ui) * (1 - 0.07 * bump(t, c.click, 0.22));
+    const bg = mixColor(COL.ink, COL.accent, prog(t, c.success, 0.15));
+    Object.assign(box.style, {
+      left: px(cx - w / 2), top: px(cy - h / 2), width: px(w), height: px(h), borderRadius: px(rad),
+      background: t < c.card ? bg : mixColor(COL.accent, COL.ink, prog(t, c.card, 0.2)),
+    });
+    tf(box, 0, 0, s);
+
+    label.style.opacity = 1 - prog(t, c.loader - 0.1, 0.12);
+    ring.style.opacity = prog(t, c.loader + 0.05, 0.15) * (1 - prog(t, c.success - 0.1, 0.1));
+    ring.style.transform = `rotate(${t * 520}deg)`;
+    check.style.opacity = prog(t, c.success, 0.05) * (1 - prog(t, c.card, 0.1));
+    checkPath.style.strokeDashoffset = 60 * (1 - ease.outCubic(prog(t, c.success + 0.05, 0.3)));
+    tf(check, 0, 0, lerp(0.6, 1, spring(t - c.success, SPRING.snappy)));
+
+    card.style.opacity = prog(t, c.card + 0.2, 0.2) * (1 - prog(t, c.collapse - 0.15, 0.12));
+    bars.forEach((b, i) => { b.style.transform = `scaleY(${spring(t - (c.card + 0.35 + i * 0.045), SPRING.snappy)})`; });
+    const typed = Math.floor(prog(t, c.type, 0.75) * TYPE_LINE.length);
+    const caret = t < c.type + 0.8 || Math.floor(t * 3) % 2 === 0;
+    footer.innerHTML = `${TYPE_LINE.slice(0, typed)}<span style="color:${COL.accent};opacity:${caret && t > c.type - 0.3 ? 1 : 0}">▌</span>`;
+
+    const rp = prog(t, c.click, 0.45);
+    ripple.style.opacity = rp > 0 && rp < 1 ? 1 - rp : 0;
+    tf(ripple, 0, 0, lerp(0.3, 1.2, ease.outCubic(rp)));
+
+    const curOn = t < c.click + 1.4;
+    show(cursor, curOn);
+    if (curOn) {
+      const x = chain(t, [[c.start, W + 8 * U], [c.start + 0.3, clickX, SPRING.card], [c.click + 0.5, W + 10 * U, SPRING.card]]);
+      const y = chain(t, [[c.start, H * 0.9], [c.start + 0.3, clickY, SPRING.card], [c.click + 0.5, H * 0.88, SPRING.card]]);
+      tf(cursor, x - CUR * 0.12, y - CUR * 0.08, 1 - 0.18 * bump(t, c.click - 0.05, 0.16));
+    }
+  };
+}
+
+// ───────────────────────── D · FRAMES ─────────────────────────
+// A contact sheet of frames assembles around a counter; the center frame becomes the logo mark.
+const MARK = { S: 16 * U, x: W / 2, y: PORTRAIT ? H * 0.4 : H * 0.34 };
+
+function sceneFrames() {
+  const root = el(stage, { inset: 0 });
+  const d = T.d;
+  const cols = PORTRAIT ? 5 : LANDSCAPE ? 9 : 7;
+  const gap = 1.6 * U, gm = 5 * U;
+  const tw = (W - 2 * gm - (cols - 1) * gap) / cols, th = (tw * H) / W;
+  const rows = Math.ceil((H + gap) / (th + gap)) + 1;
+  const oy = (H - (rows * th + (rows - 1) * gap)) / 2;
+  const hc = Math.floor(cols / 2), hr = Math.floor(rows / 2);
+  const cam = el(root, { left: 0, top: 0, width: px(W), height: px(H), transformOrigin: '50% 50%' });
+  const r = rng(3);
+  const tiles = [];
+  let hero;
+  for (let row = 0; row < rows; row++) for (let col = 0; col < cols; col++) {
+    const x = gm + col * (tw + gap), y = oy + row * (th + gap);
+    const isHero = col === hc && row === hr;
+    const n = el(cam, { left: px(x), top: px(y), width: px(tw), height: px(th), borderRadius: px(0.9 * U), overflow: 'hidden', background: isHero ? COL.accent : COL.tile });
+    const t = { n, x, y, dist: Math.hypot(col - hc, row - hr) };
+    if (isHero) { hero = t; continue; }
+    el(n, { left: '8%', top: '7%', fontFamily: MONO, fontSize: px(1.6 * U), color: COL.mute }, `f${String(tiles.length * 7).padStart(3, '0')}`);
+    el(n, { left: '8%', bottom: '9%', width: `${lerp(25, 75, r())}%`, height: '4%', borderRadius: px(0.3 * U), background: 'rgba(239,236,228,.22)' });
+    tiles.push(t);
+  }
+  const maxDist = Math.max(...tiles.map(t => t.dist));
+  const glyph = el(root, { left: px(MARK.x - 3.5 * U), top: px(MARK.y - 3.5 * U), width: px(7 * U), height: px(7 * U) },
+    `<svg width="100%" height="100%" viewBox="0 0 10 10"><path d="M2 0.8 L9.2 5 L2 9.2 Z" fill="${COL.ink}" stroke="${COL.ink}" stroke-width="0.8" stroke-linejoin="round"/></svg>`);
+
+  const numSize = Math.min(fitSize(['900'], W * 0.62, { weight: 900, tracking: -0.05 }), PORTRAIT ? 42 * U : 36 * U);
+  const num = el(root, { left: 0, width: px(W), top: px(H / 2 - numSize * 0.62), textAlign: 'center', fontSize: px(numSize), fontWeight: 900, letterSpacing: '-0.05em', lineHeight: '1', color: COL.paper });
+  const label = el(root, { left: 0, width: px(W), top: px(H / 2 + numSize * 0.45), textAlign: 'center', fontFamily: MONO, fontSize: px(4 * U), letterSpacing: '0.35em', color: COL.accent }, 'FRAMES');
+  const sub = el(root, { left: 0, width: px(W), top: px(H / 2 + numSize * 0.45 + 7 * U), textAlign: 'center', fontFamily: MONO, fontSize: px(3.4 * U), color: COL.paper }, 'from one function of time');
+
+  return t => {
+    const on = t >= d.start;
+    show(root, on);
+    if (!on) return;
+    tf(cam, 0, 0, lerp(1.25, 1, ease.outCubic(prog(t, d.start, d.out - d.start))));
+    const dim = ease.inOutCubic(prog(t, d.count, 0.4)) * (1 - ease.inOutCubic(prog(t, d.out - 0.2, 0.3)));
+
+    for (const tile of tiles) {
+      const kin = spring(t - (d.start + tile.dist * 0.05), SPRING.card);
+      const kout = ease.inCubic(prog(t, d.out + (maxDist - tile.dist) * 0.03, 0.35));
+      tile.n.style.opacity = lerp(1, 0.28, dim);
+      const dx = (W / 2 - (tile.x + tw / 2)) * kout * 0.6, dy = (H / 2 - (tile.y + th / 2)) * kout * 0.6;
+      tf(tile.n, dx, dy, kin * (1 - kout));
+    }
+
+    // hero frame → logo mark
+    const m0 = d.out + 0.15;
+    const hw = chain(t, [[0, tw], [m0, MARK.S, SPRING.card]]), hh = chain(t, [[0, th], [m0, MARK.S, SPRING.card]]);
+    const hx = chain(t, [[0, hero.x + tw / 2], [m0, MARK.x, SPRING.card]]), hy = chain(t, [[0, hero.y + th / 2], [m0, MARK.y, SPRING.card]]);
+    Object.assign(hero.n.style, { left: px(hx - hw / 2), top: px(hy - hh / 2), width: px(hw), height: px(hh), borderRadius: px(chain(t, [[0, 0.9 * U], [m0, 3.6 * U]])), opacity: 1 - dim });
+    tf(hero.n, 0, 0, spring(t - d.start, SPRING.card));
+    const g = spring(t - (T.e.start + 0.3), SPRING.snappy);
+    glyph.style.opacity = clamp(g * 2);
+    tf(glyph, 0, 0, g, lerp(-90, 0, g));
+
+    const v = Math.round(900 * ease.outExpo(prog(t, d.count, d.countEnd - d.count)));
+    num.textContent = String(v).padStart(3, '0');
+    const kout = ease.inCubic(prog(t, d.out - 0.15, 0.3));
+    [[num, d.count, 6], [label, d.count + 0.25, 3], [sub, d.count + 0.45, 3]].forEach(([n, t0, dy]) => {
+      const k = spring(t - t0, SPRING.text);
+      n.style.opacity = clamp(k * 1.5) * (1 - kout);
+      tf(n, 0, (1 - k) * dy * U - kout * 8 * U, n === num ? lerp(0.92, 1, k) : 1);
+    });
+  };
+}
+
+// ───────────────────────── E · END CARD ─────────────────────────
+function sceneEnd() {
+  const root = el(stage, { inset: 0 });
+  const opts = { weight: 800, tracking: -0.045 };
+  const size = Math.min(fitSize(['motion studio'], W - 2 * M, opts), PORTRAIT ? 12 * U : 10 * U);
+  const word = typeLine(root, 'motion studio', { size, ...opts });
+  Object.assign(word.line.style, { left: px((W - word.w) / 2), top: px(MARK.y + MARK.S / 2 + 4 * U) });
+  const tagTop = MARK.y + MARK.S / 2 + 4 * U + word.h + 3 * U;
+  const tags = ['Claude writes the code.', 'Your machine renders the video.'].map((s, i) =>
+    el(root, { left: 0, width: px(W), top: px(tagTop + i * 5.4 * U), textAlign: 'center', fontFamily: MONO, fontSize: px(3.6 * U), color: i ? '#b9b5ab' : COL.paper }, s));
+
+  return t => {
+    const on = t >= T.e.start;
+    show(root, on);
+    if (!on) return;
+    riseChars(word, t, T.e.start + 0.3, Infinity, { stagger: 0.028 });
+    tags.forEach((n, i) => {
+      const k = spring(t - (T.e.start + 0.75 + i * 0.12), SPRING.text);
+      n.style.opacity = clamp(k);
+      tf(n, 0, (1 - k) * 2 * U);
+    });
+  };
+}
+
+// ───────────────────────── seek(t) ─────────────────────────
+const scenes = [];
+window.__comp = { width: W, height: H, fps: FPS, duration: DURATION, format: FORMAT };
+window.seek = t => { t = clamp(t, 0, DURATION); for (const draw of scenes) draw(t); };
+window.ready = document.fonts.ready.then(() => {
+  scenes.push(sceneHook(), sceneTime(), sceneMorph(), sceneFrames(), sceneEnd());
+  window.seek(0);
+});
+
+// ───────────────────────── preview UI (never used while rendering) ─────────────────────────
+if (!params.has('render')) {
+  const wrap = document.getElementById('wrap'), scrub = document.getElementById('scrub');
+  const time = document.getElementById('time'), btn = document.getElementById('play');
+  scrub.max = DURATION;
+  const fit = () => {
+    const s = Math.min(innerWidth / W, (innerHeight - 44) / H);
+    wrap.style.transform = `translate(${(innerWidth - W * s) / 2}px,${(innerHeight - 44 - H * s) / 2}px) scale(${s})`;
+  };
+  fit();
+  addEventListener('resize', fit);
+  let t = Number(params.get('t') ?? 0), playing = false, last = 0;
+  const go = v => { t = v; scrub.value = v; time.textContent = `${v.toFixed(3)}s`; window.seek(v); };
+  const tick = now => {
+    if (!playing) return;
+    go((t + (now - last) / 1000) % DURATION);
+    last = now;
+    requestAnimationFrame(tick);
+  };
+  const toggle = () => {
+    playing = !playing;
+    btn.textContent = playing ? 'pause' : 'play';
+    last = performance.now();
+    if (playing) requestAnimationFrame(tick);
+  };
+  btn.onclick = toggle;
+  scrub.oninput = () => { if (playing) toggle(); go(Number(scrub.value)); };
+  addEventListener('keydown', e => {
+    if (e.code === 'Space') { e.preventDefault(); toggle(); }
+    if (e.key === 'ArrowRight') go(Math.min(DURATION, t + 1 / FPS));
+    if (e.key === 'ArrowLeft') go(Math.max(0, t - 1 / FPS));
+  });
+  window.ready.then(() => go(t));
+}
+</script>
+</body>
+</html>
